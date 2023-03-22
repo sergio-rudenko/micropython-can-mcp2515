@@ -17,6 +17,7 @@ import time
 
 from lib.mcp2515 import (
     CAN,
+    CanWithQueue,
     CAN_CLOCK,
     CAN_EFF_FLAG,
     CAN_ERR_FLAG,
@@ -27,55 +28,67 @@ from lib.mcp2515 import (
 from lib.mcp2515 import SPIESP32 as SPI
 from lib.mcp2515 import CANFrame
 
+import micropython
+import uasyncio as asyncio
 
 SPI_ESP32_CS_PIN = 23
 
 
-def main():
-    def print_error(text: str):
-        print(f'ERROR: {text}')
+def print_error(text: str):
+    print(f'ERROR: {text}')
 
-    # Initialization
-    can = CAN(SPI(cs=SPI_ESP32_CS_PIN))
 
-    # Configuration
-    if can.reset() != ERROR.ERROR_OK:
-        print_error("Can not reset for MCP2515")
-        return
-    if can.setBitrate(CAN_SPEED.CAN_125KBPS, CAN_CLOCK.MCP_8MHZ) != ERROR.ERROR_OK:
-        print_error("Can not set bitrate for MCP2515")
-        return
-    if can.setListenOnlyMode() != ERROR.ERROR_OK:
-        print_error("Can not set mode for MCP2515")
-        return
+# Initialization
+can = CanWithQueue(SPI(cs=SPI_ESP32_CS_PIN))
 
-    # Prepare frames
-    data = b"\x12\x34\x56\x78\x9A\xBC\xDE\xF0"
-    sff_frame = CANFrame(can_id=0x7FF, data=data)
-    sff_none_data_frame = CANFrame(can_id=0x7FF)
-    err_frame = CANFrame(can_id=0x7FF | CAN_ERR_FLAG, data=data)
-    eff_frame = CANFrame(can_id=0x12345678 | CAN_EFF_FLAG, data=data)
-    eff_none_data_frame = CANFrame(can_id=0x12345678 | CAN_EFF_FLAG)
-    rtr_frame = CANFrame(can_id=0x7FF | CAN_RTR_FLAG)
-    rtr_with_eid_frame = CANFrame(can_id=0x12345678 | CAN_RTR_FLAG | CAN_EFF_FLAG)
-    rtr_with_data_frame = CANFrame(can_id=0x7FF | CAN_RTR_FLAG, data=data)
-    frames = [
-        sff_frame,
-        sff_none_data_frame,
-        err_frame,
-        eff_frame,
-        eff_none_data_frame,
-        rtr_frame,
-        rtr_with_eid_frame,
-        rtr_with_data_frame,
-    ]
+# Configuration
+if can.reset() != ERROR.ERROR_OK:
+    print_error("Can not reset for MCP2515")
+print(f'CAN interrupt after reset -> {can.getInterruptMask()}')
 
-    # Read all the time and send message in each second
-    end_time, n = time.ticks_add(time.ticks_ms(), 1000), -1
-    while True:
-        error, iframe = can.readMessage()
-        if error == ERROR.ERROR_OK:
-            print("RX  {}".format(iframe))
+if can.setBitrate(CAN_SPEED.CAN_125KBPS, CAN_CLOCK.MCP_8MHZ) != ERROR.ERROR_OK:
+    print_error("Can not set bitrate for MCP2515")
+print(f'CAN interrupt after set bitrate -> {can.getInterruptMask()}')
+
+if can.setNormalMode() != ERROR.ERROR_OK:
+    print_error("Can not set mode for MCP2515")
+
+print(f'CAN interrupt after set normal mode -> {can.getInterruptMask()}')
+
+# Prepare frames
+data = b"\x12\x34\x56\x78\x9A\xBC\xDE\xF0"
+sff_frame = CANFrame(can_id=0x7FF, data=data)
+sff_none_data_frame = CANFrame(can_id=0x7FF)
+err_frame = CANFrame(can_id=0x7FF | CAN_ERR_FLAG, data=data)
+eff_frame = CANFrame(can_id=0x12345678 | CAN_EFF_FLAG, data=data)
+eff_none_data_frame = CANFrame(can_id=0x12345678 | CAN_EFF_FLAG)
+rtr_frame = CANFrame(can_id=0x7FF | CAN_RTR_FLAG)
+rtr_with_eid_frame = CANFrame(can_id=0x12345678 | CAN_RTR_FLAG | CAN_EFF_FLAG)
+rtr_with_data_frame = CANFrame(can_id=0x7FF | CAN_RTR_FLAG, data=data)
+frames = [
+    sff_frame,
+    sff_none_data_frame,
+    err_frame,
+    eff_frame,
+    eff_none_data_frame,
+    rtr_frame,
+    rtr_with_eid_frame,
+    rtr_with_data_frame,
+]
+
+# Read all the time and send message in each second
+end_time, n = time.ticks_add(time.ticks_ms(), 1000), -1
+
+        # if not can.empty():
+        #     print(f'MSG -> {can.get_nowait()}')
+        # time.sleep_ms(10)
+        # error, iframe = can.readMessage()
+        # if error == ERROR.ERROR_OK:
+            # print("RX  {}".format(iframe))
+            # if prev_iframe != iframe:
+            #     prev_iframe = iframe
+            # else:
+            #     print("lost frame!")
 
         # else:
         #     print_error(f'num: {error}')
@@ -92,10 +105,33 @@ def main():
         #         print("TX  {}".format(frames[n]))
         #     else:
         #         print("TX failed with error code {}".format(error))
+s = ''
 
 
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        pass
+async def aprint():
+    global s
+    while True:
+        if len(s):
+            c = s[0]
+            if c != '\r' and c != '\n':
+                print(s[0], end='')
+            else:
+                print()
+            s = s[1:]
+        await asyncio.sleep_ms(0)
+
+asyncio.create_task(aprint())
+
+
+async def start():
+    global s
+    while True:
+        try:
+            temp = await can.get()
+            temp = temp + '\r'
+            s = s + temp
+            await asyncio.sleep_ms(0)
+        except KeyboardInterrupt:
+            exit(0)
+
+asyncio.run(start())

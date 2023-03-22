@@ -1,3 +1,5 @@
+import uasyncio as asyncio
+
 try:
     from typing import Any, Optional, List, Tuple
 except ImportError:
@@ -73,10 +75,8 @@ try:
 except ImportError:
     from machine import Pin
 
-
 TXBnREGS = collections.namedtuple("TXBnREGS", "CTRL SIDH DATA")
 RXBnREGS = collections.namedtuple("RXBnREGS", "CTRL SIDH DATA CANINTFRXnIF")
-
 
 TXB = [
     TXBnREGS(REGISTER.MCP_TXB0CTRL, REGISTER.MCP_TXB0SIDH, REGISTER.MCP_TXB0DATA),
@@ -195,7 +195,7 @@ class CAN:
         self.SPI.end()
 
     def modifyRegister(
-        self, reg: int, mask: int, data: int, spifastend: bool = False
+            self, reg: int, mask: int, data: int, spifastend: bool = False
     ) -> None:
         self.SPI.start()
         self.SPI.transfer(INSTRUCTION.INSTRUCTION_BITMOD)
@@ -365,7 +365,7 @@ class CAN:
 
         data.extend(bytearray(1 + frame.dlc))
         data[MCP_DLC] = mcp_dlc
-        data[MCP_DATA : MCP_DATA + frame.dlc] = frame.data
+        data[MCP_DATA: MCP_DATA + frame.dlc] = frame.data
 
         self.setRegisters(txbuf.SIDH, data)
 
@@ -489,3 +489,90 @@ class CAN:
         # self.modifyRegister(REGISTER.MCP_EFLG, EFLG.EFLG_RX0OVR | EFLG.EFLG_RX1OVR, 0)
         # self.clearInterrupts()
         self.modifyRegister(REGISTER.MCP_CANINTF, CANINTF.CANINTF_ERRIF, 0)
+
+
+# Exception raised by get_nowait().
+class QueueEmpty(Exception):
+    pass
+
+
+# Exception raised by put_nowait().
+class QueueFull(Exception):
+    pass
+
+
+class CanWithQueue(CAN):
+    def __init__(self, spi: Any, queue_maxsize: int = 10):
+        super().__init__(SPI=spi)
+        self._queue_maxsize = queue_maxsize
+        self._queue = []
+        self._put_event = asyncio.Event()  # Triggered by put, tested by get
+        self._get_event = asyncio.Event()  # Triggered by get, tested by put
+        self._stop_event = asyncio.Event()
+        asyncio.create_task(self._run())
+
+    def _get(self):
+        self._get_event.set()  # Schedule all tasks waiting on get
+        self._get_event.clear()
+        return self._queue.pop(0)
+
+    async def get(self) -> str:  # Usage: item = await queue.get()
+        while self.empty():  # May be multiple tasks waiting on get()
+            # Queue is empty, suspend task until a put occurs
+            # 1st of N tasks gets, the rest loop again
+            await self._put_event.wait()
+        return str(self._get())
+
+    def get_nowait(self):  # Remove and return an item from the queue.
+        # Return an item if one is immediately available, else raise QueueEmpty.
+        if self.empty():
+            raise QueueEmpty()
+        return self._get()
+
+    def _put(self, val):
+        self._put_event.set()  # Schedule tasks waiting on put
+        self._put_event.clear()
+        self._queue.append(val)
+
+    # async def put(self, val):  # Usage: await queue.put(item)
+    #     while self.full():
+    #         # Queue full
+    #         await self._get_event.wait()
+    #         # Task(s) waiting to get from queue, schedule first Task
+    #     self._put(val)
+
+    def _put_nowait(self, val):  # Put an item into the queue without blocking.
+        if self.full():
+            raise QueueFull()
+        self._put(val)
+
+    def qsize(self):  # Number of items in the queue.
+        return len(self._queue)
+
+    def empty(self):  # Return True if the queue is empty, False otherwise.
+        return len(self._queue) == 0
+
+    def full(self):  # Return True if there are maxsize items in the queue.
+        # Note: if the Queue was initialized with maxsize=0 (the default) or
+        # any negative number, then full() is never True.
+        return 0 < self._queue_maxsize <= self.qsize()
+
+    def task_is_stopped(self):
+        return self._stop_event.is_set()
+
+    def task_stop(self):
+        self._stop_event.set()
+
+    async def _run(self):
+        print('CAN task is run')
+        while not self.task_is_stopped():
+            error, iframe = self.readMessage()
+            if error == ERROR.ERROR_OK:
+                try:
+                    self._put_nowait(iframe)
+                except QueueFull:
+                    pass
+            elif error != ERROR.ERROR_NOMSG:
+                print(f'CAN read error -> {error}')
+            await asyncio.sleep_ms(0)
+        print('CAN task is finished')

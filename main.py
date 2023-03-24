@@ -39,21 +39,17 @@ def print_error(text: str):
 
 
 # Initialization
-can = CanWithQueue(SPI(cs=SPI_ESP32_CS_PIN))
+can = CanWithQueue(SPI(cs=SPI_ESP32_CS_PIN), int_gpio=18, queue_size=5)
 
 # Configuration
 if can.reset() != ERROR.ERROR_OK:
     print_error("Can not reset for MCP2515")
-print(f'CAN interrupt after reset -> {can.getInterruptMask()}')
 
 if can.setBitrate(CAN_SPEED.CAN_125KBPS, CAN_CLOCK.MCP_8MHZ) != ERROR.ERROR_OK:
     print_error("Can not set bitrate for MCP2515")
-print(f'CAN interrupt after set bitrate -> {can.getInterruptMask()}')
 
 if can.setNormalMode() != ERROR.ERROR_OK:
     print_error("Can not set mode for MCP2515")
-
-print(f'CAN interrupt after set normal mode -> {can.getInterruptMask()}')
 
 # Prepare frames
 data = b"\x12\x34\x56\x78\x9A\xBC\xDE\xF0"
@@ -105,33 +101,35 @@ end_time, n = time.ticks_add(time.ticks_ms(), 1000), -1
         #         print("TX  {}".format(frames[n]))
         #     else:
         #         print("TX failed with error code {}".format(error))
-s = ''
 
 
-async def aprint():
-    global s
-    while True:
-        if len(s):
-            c = s[0]
-            if c != '\r' and c != '\n':
-                print(s[0], end='')
-            else:
-                print()
-            s = s[1:]
-        await asyncio.sleep_ms(0)
+# asyncio.create_task(aprint())
+prev = None
 
-asyncio.create_task(aprint())
+import micropython
+micropython.alloc_emergency_exception_buf(100)
 
 
 async def start():
-    global s
-    while True:
+    while not can.task_is_stopped():
         try:
-            temp = await can.get()
-            temp = temp + '\r'
-            s = s + temp
-            await asyncio.sleep_ms(0)
+            print(f'Read from queue -> {await can.queue_get()}')
+            await asyncio.sleep_ms(1000)
         except KeyboardInterrupt:
             exit(0)
+    # counter = 0
+    #
+    # print('Analiz start')
+    # while not can.empty():
+    #     global prev
+    #     counter += 1
+    #     now = can.get_nowait()
+    #     print(now)
+    #     if prev is None:
+    #         prev = now
+    #     elif prev == now:
+    #         print('Error on step ', counter)
+    #
+    #     prev = now
 
 asyncio.run(start())

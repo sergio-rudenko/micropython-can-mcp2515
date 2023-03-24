@@ -1,3 +1,5 @@
+import machine
+import micropython
 import uasyncio as asyncio
 
 try:
@@ -497,65 +499,114 @@ class QueueEmpty(Exception):
 
 
 # Exception raised by put_nowait().
-class QueueFull(Exception):
+class QueueFullException(Exception):
     pass
 
 
 class CanWithQueue(CAN):
-    def __init__(self, spi: Any, queue_maxsize: int = 10):
+    def __init__(self,
+                 spi: Any,
+                 int_gpio: int,
+                 queue_size: int = 100,
+                 ):
         super().__init__(SPI=spi)
-        self._queue_maxsize = queue_maxsize
+
+        #  Interrupt
+        self._int_pin = Pin(int_gpio, Pin.IN)
+        # self._int_pin.irq(trigger=Pin.IRQ_FALLING, handler=self._can_irq_handler)
+
+        #  Queue
         self._queue = []
-        self._put_event = asyncio.Event()  # Triggered by put, tested by get
-        self._get_event = asyncio.Event()  # Triggered by get, tested by put
+        for i in range(queue_size):
+            self._queue.append(CANFrame(can_id=i))
+        # print(f'Created queue -> {self._queue}')
+        self._queue_size = len(self._queue)
+        # print(f'Queue size -> {self._queue_size}')
+        self._queue_write_pointer = 0
+        self._queue_read_pointer = 0
+        self._queue_put_event = asyncio.ThreadSafeFlag()  # Triggered by put, tested by get
+        self._queue_get_event = asyncio.ThreadSafeFlag()  # Triggered by get, tested by put
+        self._queue_full_flag = False
+        self._can_error = None
+        self.irq = None
         self._stop_event = asyncio.Event()
         asyncio.create_task(self._run())
 
-    def _get(self):
-        self._get_event.set()  # Schedule all tasks waiting on get
-        self._get_event.clear()
-        return self._queue.pop(0)
+    def _can_irq_handler(self, pin):
+        error, iframe = self.readMessage()
+        # if self._queue_full_flag:
+        #     pass
+        # self._can_error += 1
+        # if self.queue_full():
+        #     self._can_error = 'ERROR'
+        # return
+        # else:
+        #     self._queue_full_flag = False
+        #     micropython.schedule(self._message_from_irq, 'Queue is unblocked')
 
-    async def get(self) -> str:  # Usage: item = await queue.get()
-        while self.empty():  # May be multiple tasks waiting on get()
-            # Queue is empty, suspend task until a put occurs
-            # 1st of N tasks gets, the rest loop again
-            await self._put_event.wait()
-        return str(self._get())
+        if error == ERROR.ERROR_OK:
+            pass
+            # micropython.schedule(self._data_from_irq, iframe)
+            # if not self.queue_put_sync(iframe):
+            #     self._queue_full_flag = True
+            #     self._int_pin.irq(handler=None)
+            #     print('Queue is full')
+            # micropython.schedule(self._message_from_irq, 'Queue is blocked')
 
-    def get_nowait(self):  # Remove and return an item from the queue.
-        # Return an item if one is immediately available, else raise QueueEmpty.
-        if self.empty():
-            raise QueueEmpty()
-        return self._get()
+    def _data_from_irq(self, arg):
+        print(f'Data from IQR -> {arg}')
+        # self.queue_put_sync(v=arg, block=True)
 
-    def _put(self, val):
-        self._put_event.set()  # Schedule tasks waiting on put
-        self._put_event.clear()
-        self._queue.append(val)
+    def _message_from_irq(self, arg):
+        print(f'IRQ message: {self.__class__.__name__} -> {arg}')
 
-    # async def put(self, val):  # Usage: await queue.put(item)
-    #     while self.full():
-    #         # Queue full
-    #         await self._get_event.wait()
-    #         # Task(s) waiting to get from queue, schedule first Task
-    #     self._put(val)
+    def queue_full(self):
+        return ((self._queue_write_pointer + 1) % self._queue_size) == self._queue_read_pointer
 
-    def _put_nowait(self, val):  # Put an item into the queue without blocking.
-        if self.full():
-            raise QueueFull()
-        self._put(val)
+    def queue_empty(self):
+        return self._queue_read_pointer == self._queue_write_pointer
 
-    def qsize(self):  # Number of items in the queue.
-        return len(self._queue)
+    def queue_free(self):
+        return (self._queue_write_pointer - self._queue_read_pointer) % self._queue_size
 
-    def empty(self):  # Return True if the queue is empty, False otherwise.
-        return len(self._queue) == 0
+    def queue_get_sync(self, block=False):  # Remove and return an item from the queue.
+        if not block and self.queue_empty():
+            raise IndexError  # Not allowed to block
+        while self.queue_empty():  # Block until an item appears
+            pass
+        r = self._queue[self._queue_read_pointer]
+        self._queue_read_pointer = (self._queue_read_pointer + 1) % self._queue_size
+        self._queue_get_event.set()
+        return r
 
-    def full(self):  # Return True if there are maxsize items in the queue.
-        # Note: if the Queue was initialized with maxsize=0 (the default) or
-        # any negative number, then full() is never True.
-        return 0 < self._queue_maxsize <= self.qsize()
+    def queue_put_sync(self, v, block=False) -> bool:
+        self._queue[self._queue_write_pointer] = v
+        self._queue_put_event.set()  # Schedule task waiting on get
+        if not block and self.queue_full():
+            return False
+        while self.queue_full():
+            pass  # can't bump ._wi until an item is removed
+        self._queue_write_pointer = (self._queue_write_pointer + 1) % self._queue_size
+        return True
+
+    async def queue_put(self, val):  # Usage: await queue.put(item)
+        while self.queue_full():  # Queue full
+            await self._queue_get_event.wait()
+        self.queue_put_sync(val)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return await self.queue_get()
+
+    async def queue_get(self):
+        while self.queue_empty():
+            await self._queue_put_event.wait()
+        r = self._queue[self._queue_read_pointer]
+        self._queue_read_pointer = (self._queue_read_pointer + 1) % self._queue_size
+        self._queue_get_event.set()  # Schedule task waiting on ._evget
+        return r
 
     def task_is_stopped(self):
         return self._stop_event.is_set()
@@ -566,13 +617,35 @@ class CanWithQueue(CAN):
     async def _run(self):
         print('CAN task is run')
         while not self.task_is_stopped():
-            error, iframe = self.readMessage()
-            if error == ERROR.ERROR_OK:
-                try:
-                    self._put_nowait(iframe)
-                except QueueFull:
-                    pass
-            elif error != ERROR.ERROR_NOMSG:
-                print(f'CAN read error -> {error}')
+            while self._int_pin.value() == 0:
+                error, iframe = self.readMessage()
+                if not self.queue_put_sync(iframe):
+                #     pass
+                    print('Full queue!!!')
+            # try:
+            #     if not self.queue_full() and self.irq is not None:
+                    # print('Restore IRQ')
+                    # machine.enable_irq(self.irq)
+                    # self.irq = None
+                    # error, frame = self.readMessage()
+                    # error, frame = self.readMessage()
+                    # self._int_pin.irq(trigger=Pin.IRQ_FALLING, handler=self._can_irq_handler)
+                    # pass
+                # self.queue_put_sync(CANFrame(can_id=counter, data=b'12345678'))
+            # except IndexError as e:
+            #     print(f'Put error -> {e}')
+            #     pass
+            # error, iframe = self.readMessage()
+            # if error == ERROR.ERROR_OK:
+            #     try:
+            #         self._put_nowait(iframe)
+            #     except QueueFull:
+            #         self.task_stop()
+            #         break
+            # elif error != ERROR.ERROR_NOMSG:
+            #     print(f'CAN read error -> {error}')
+            #     break
+            # else:
+            #     break
             await asyncio.sleep_ms(0)
         print('CAN task is finished')
